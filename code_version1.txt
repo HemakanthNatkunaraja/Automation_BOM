@@ -1,0 +1,1272 @@
+/**
+ * PART 1: CONFIGURATION & CORE FUNCTIONS
+ * Copy this first, then add Part 2 and Part 3
+ */
+
+// ==================== MAIN CONFIGURATION ====================
+const CONFIG = {
+  // Sheet configuration
+  PRODUCT_SHEET_NAME: 'Products',
+  LOG_SHEET_NAME: 'Change_Log',
+  
+  // Update frequency (in minutes)
+  UPDATE_INTERVAL: 1,
+  
+  // Email alerts
+  ALERT_EMAIL: 'hemakanthnatkunaraja@gmail.com',
+  PRICE_CHANGE_THRESHOLD: 0.05, // 5% price change triggers alert
+  
+  // Data sources - Add your supplier APIs here
+  SUPPLIERS: {
+    'digikey': {
+      baseUrl: 'https://api.digikey.com/products/v4/',
+      apiKey: 'configured_via_oauth',
+      rateLimit: 1000
+    },
+    'mouser': {
+      baseUrl: 'https://api.mouser.com/api/v1/',
+      apiKey: '081cf7a6-ac96-4407-8481-ab7ed33ddb11',
+      rateLimit: 10000
+    }
+  }
+};
+
+// ==================== DIGI-KEY CONFIGURATION ====================
+const DIGIKEY_CONFIG = {
+  CLIENT_ID: 'vKzIvhHyOX0J0119jxKzmRAQJAiqlaNbh2WcBTf3Yxsdkfny',
+  CLIENT_SECRET: '05xYWhK03joB1Ohtv0uZpkDUZIGTDKdHQMwwn4xbyIosNfX9wkeab0H7yQvPkefE',
+  TOKEN_URL: 'https://api.digikey.com/v1/oauth2/token',
+  SEARCH_URL: 'https://api.digikey.com/products/v4/search/keyword',
+  PRODUCT_URL: 'https://api.digikey.com/products/v4/',
+  MAX_REQUESTS_PER_DAY: 1000,
+  REQUESTS_PER_MINUTE: 10
+};
+
+// ==================== MOUSER CONFIGURATION ====================
+const MOUSER_CONFIG = {
+  API_KEY: '1a735fca-f94f-4fa3-9992-cb4a2daf9733',
+  SEARCH_URL: 'https://api.mouser.com/api/v1/search/partnumber',
+  KEYWORD_SEARCH_URL: 'https://api.mouser.com/api/v1/search/keyword',
+  MAX_REQUESTS_PER_DAY: 10000,
+  REQUESTS_PER_MINUTE: 100
+};
+
+// ==================== MAIN FUNCTIONS ====================
+
+function updateAllProducts() {
+  console.log('Starting product update process...');
+  
+  try {
+    const sheet = getOrCreateSheet(CONFIG.PRODUCT_SHEET_NAME);
+    const products = getProductData(sheet);
+    
+    console.log('Found ' + products.length + ' products to update');
+    
+    let updatedCount = 0;
+    const changes = [];
+    
+    products.forEach((product, index) => {
+      const updates = checkForUpdates(product);
+      
+      if (updates.length > 0) {
+        applyUpdates(sheet, index + 2, updates);
+        changes.push(...updates);
+        updatedCount++;
+      }
+      
+      if (index % 10 === 0) {
+        Utilities.sleep(1000);
+      }
+    });
+    
+    if (changes.length > 0) {
+      logChanges(changes);
+      sendUpdateNotification(changes);
+    }
+    
+    console.log('Update complete. ' + updatedCount + ' products updated with ' + changes.length + ' total changes.');
+    
+  } catch (error) {
+    console.error('Error during update process:', error);
+    sendErrorNotification(error);
+  }
+}
+
+function setupAutomaticUpdates() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  
+  ScriptApp.newTrigger('updateAllProducts')
+    .timeBased()
+    .everyHours(1)
+    .create();
+  
+  ScriptApp.newTrigger('generateDailyReport')
+    .timeBased()
+    .everyDays(1)
+    .atHour(8)
+    .create();
+  
+  console.log('Automatic update triggers configured successfully!');
+}
+
+// ==================== DATA PROCESSING ====================
+
+function getProductData(sheet) {
+  const data = sheet.getDataRange().getValues();
+  const headers = data[0];
+  const products = [];
+  
+  for (let i = 1; i < data.length; i++) {
+    const product = {};
+    headers.forEach((header, index) => {
+      product[header] = data[i][index];
+    });
+    product.rowIndex = i + 1;
+    products.push(product);
+  }
+  
+  return products;
+}
+
+function checkForUpdates(product) {
+  const updates = [];
+  
+  try {
+    const priceUpdate = checkPriceUpdate(product);
+    if (priceUpdate) updates.push(priceUpdate);
+    
+    const availabilityUpdate = checkAvailabilityUpdate(product);
+    if (availabilityUpdate) updates.push(availabilityUpdate);
+    
+    const leadTimeUpdate = checkLeadTimeUpdate(product);
+    if (leadTimeUpdate) updates.push(leadTimeUpdate);
+    
+  } catch (error) {
+    console.error('Error checking updates for ' + product['Part Number'] + ':', error);
+  }
+  
+  return updates;
+}
+
+function checkPriceUpdate(product) {
+  const partNumber = product['Part Number'];
+  const currentPrice = parseFloat(product['Unit Price'] || 0);
+  const supplier = product['Supplier'];
+  
+  if (!partNumber || !supplier) return null;
+  
+  try {
+    const newPrice = fetchPriceFromSupplier(partNumber, supplier);
+    
+    if (newPrice && Math.abs(newPrice - currentPrice) > 0.01) {
+      const changePercent = ((newPrice - currentPrice) / currentPrice) * 100;
+      
+      return {
+        type: 'price',
+        partNumber: partNumber,
+        field: 'Unit Price',
+        oldValue: currentPrice,
+        newValue: newPrice,
+        changePercent: changePercent.toFixed(2),
+        timestamp: new Date(),
+        significant: Math.abs(changePercent) > CONFIG.PRICE_CHANGE_THRESHOLD * 100
+      };
+    }
+  } catch (error) {
+    console.error('Price check failed for ' + partNumber + ':', error);
+  }
+  
+  return null;
+}
+
+function checkAvailabilityUpdate(product) {
+  const partNumber = product['Part Number'];
+  const currentStock = parseInt(product['Stock Quantity'] || 0);
+  const supplier = product['Supplier'];
+  
+  if (!partNumber || !supplier) return null;
+  
+  try {
+    const newStock = fetchStockFromSupplier(partNumber, supplier);
+    
+    if (newStock !== null && newStock !== currentStock) {
+      return {
+        type: 'availability',
+        partNumber: partNumber,
+        field: 'Stock Quantity',
+        oldValue: currentStock,
+        newValue: newStock,
+        timestamp: new Date(),
+        significant: newStock === 0 || (currentStock === 0 && newStock > 0)
+      };
+    }
+  } catch (error) {
+    console.error('Availability check failed for ' + partNumber + ':', error);
+  }
+  
+  return null;
+}
+
+function checkLeadTimeUpdate(product) {
+  const partNumber = product['Part Number'];
+  const currentLeadTime = product['Lead Time'];
+  const supplier = product['Supplier'];
+  
+  if (!partNumber || !supplier) return null;
+  
+  try {
+    const newLeadTime = fetchLeadTimeFromSupplier(partNumber, supplier);
+    
+    if (newLeadTime && newLeadTime !== currentLeadTime) {
+      return {
+        type: 'leadtime',
+        partNumber: partNumber,
+        field: 'Lead Time',
+        oldValue: currentLeadTime,
+        newValue: newLeadTime,
+        timestamp: new Date(),
+        significant: true
+      };
+    }
+  } catch (error) {
+    console.error('Lead time check failed for ' + partNumber + ':', error);
+  }
+  
+  return null;
+}
+
+// ==================== SUPPLIER INTEGRATIONS ====================
+
+function fetchPriceFromSupplier(partNumber, supplier) {
+  supplier = supplier.toLowerCase();
+  
+  switch (supplier) {
+    case 'digikey':
+      return fetchDigikeyPrice(partNumber);
+    case 'mouser':
+      return fetchMouserPrice(partNumber);
+    default:
+      return null;
+  }
+}
+
+function fetchStockFromSupplier(partNumber, supplier) {
+  supplier = supplier.toLowerCase();
+  
+  switch (supplier) {
+    case 'digikey':
+      return fetchDigikeyStock(partNumber);
+    case 'mouser':
+      return fetchMouserStock(partNumber);
+    default:
+      return null;
+  }
+}
+
+function fetchLeadTimeFromSupplier(partNumber, supplier) {
+  supplier = supplier.toLowerCase();
+  
+  switch (supplier) {
+    case 'digikey':
+      return fetchDigikeyLeadTime(partNumber);
+    case 'mouser':
+      return fetchMouserLeadTime(partNumber);
+    default:
+      return null;
+  }
+}
+/**
+ * PART 2: API INTEGRATIONS
+ * Add this after Part 1
+ */
+
+// ==================== DIGI-KEY API INTEGRATION ====================
+
+function getDigiKeyAccessToken() {
+  try {
+    console.log('🔑 Requesting Digi-Key access token...');
+    
+    const payload = {
+      'client_id': DIGIKEY_CONFIG.CLIENT_ID,
+      'client_secret': DIGIKEY_CONFIG.CLIENT_SECRET,
+      'grant_type': 'client_credentials'
+    };
+    
+    const options = {
+      'method': 'POST',
+      'headers': {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      },
+      'payload': Object.keys(payload).map(key => 
+        encodeURIComponent(key) + '=' + encodeURIComponent(payload[key])
+      ).join('&'),
+      'muteHttpExceptions': true
+    };
+    
+    const response = UrlFetchApp.fetch(DIGIKEY_CONFIG.TOKEN_URL, options);
+    const responseCode = response.getResponseCode();
+    const responseText = response.getContentText();
+    
+    if (responseCode === 200) {
+      const data = JSON.parse(responseText);
+      
+      PropertiesService.getScriptProperties().setProperties({
+        'digikey_token': data.access_token,
+        'digikey_token_expiry': (Date.now() + (data.expires_in * 1000)).toString()
+      });
+      
+      console.log('✅ Digi-Key access token obtained successfully');
+      return data.access_token;
+    } else {
+      console.error('❌ Token request failed: ' + responseCode);
+      console.error('Response: ' + responseText);
+      throw new Error('Token request failed: ' + responseCode + ' - ' + responseText);
+    }
+  } catch (error) {
+    console.error('Failed to get Digi-Key access token:', error);
+    throw error;
+  }
+}
+
+function getValidDigiKeyToken() {
+  const properties = PropertiesService.getScriptProperties();
+  const token = properties.getProperty('digikey_token');
+  const expiry = properties.getProperty('digikey_token_expiry');
+  
+  if (token && expiry && Date.now() < parseInt(expiry)) {
+    return token;
+  }
+  
+  return getDigiKeyAccessToken();
+}
+
+function searchDigiKeyProduct(partNumber) {
+  try {
+    const token = getValidDigiKeyToken();
+    
+    const searchPayload = {
+      'Keywords': partNumber,
+      'RecordCount': 1,
+      'RecordStartPosition': 0,
+      'SearchOptions': ['ManufacturerPartSearch'],
+      'Sort': {
+        'Option': 'SortByUnitPrice',
+        'Direction': 'Ascending'
+      }
+    };
+    
+    const options = {
+      'method': 'POST',
+      'headers': {
+        'Authorization': 'Bearer ' + token,
+        'Content-Type': 'application/json',
+        'X-DIGIKEY-Client-Id': DIGIKEY_CONFIG.CLIENT_ID,
+        'X-DIGIKEY-Locale-Site': 'US',
+        'X-DIGIKEY-Locale-Language': 'en',
+        'X-DIGIKEY-Locale-Currency': 'USD'
+      },
+      'payload': JSON.stringify(searchPayload),
+      'muteHttpExceptions': true
+    };
+    
+    const response = UrlFetchApp.fetch(DIGIKEY_CONFIG.SEARCH_URL, options);
+    const responseCode = response.getResponseCode();
+    
+    if (responseCode === 200) {
+      const data = JSON.parse(response.getContentText());
+      
+      if (data.Products && data.Products.length > 0) {
+        return data.Products[0];
+      } else {
+        console.log('No products found for: ' + partNumber);
+        return null;
+      }
+    } else {
+      console.error('Digi-Key search failed: ' + responseCode);
+      return null;
+    }
+  } catch (error) {
+    console.error('Error searching Digi-Key for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function extractDigiKeyPrice(productData) {
+  try {
+    if (!productData || !productData.StandardPricing) {
+      return null;
+    }
+    
+    const pricing = productData.StandardPricing;
+    if (pricing.length > 0) {
+      const unitPrice = pricing.find(p => p.BreakQuantity === 1) || pricing[0];
+      return parseFloat(unitPrice.UnitPrice);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error extracting price from Digi-Key data:', error);
+    return null;
+  }
+}
+
+function extractDigiKeyStock(productData) {
+  try {
+    return parseInt(productData.QuantityAvailable) || 0;
+  } catch (error) {
+    console.error('Error extracting stock from Digi-Key data:', error);
+    return 0;
+  }
+}
+
+function extractDigiKeyLeadTime(productData) {
+  try {
+    if (productData.QuantityAvailable > 0) {
+      return 'In Stock';
+    } else if (productData.NonStock && productData.NonStock.LeadWeeks) {
+      return productData.NonStock.LeadWeeks + ' weeks';
+    }
+    return 'Contact Supplier';
+  } catch (error) {
+    console.error('Error extracting lead time from Digi-Key data:', error);
+    return 'Unknown';
+  }
+}
+
+function fetchDigikeyPrice(partNumber) {
+  try {
+    console.log('Fetching price for ' + partNumber + ' from Digi-Key...');
+    
+    checkDigiKeyRateLimit();
+    
+    let productData = searchDigiKeyProduct(partNumber);
+    
+    if (productData) {
+      const price = extractDigiKeyPrice(productData);
+      if (price) {
+        console.log('✅ Digi-Key price found: $' + price);
+        return price;
+      }
+    }
+    
+    console.log('❌ No price found on Digi-Key for ' + partNumber);
+    return null;
+  } catch (error) {
+    console.error('Digi-Key price fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function fetchDigikeyStock(partNumber) {
+  try {
+    checkDigiKeyRateLimit();
+    
+    let productData = searchDigiKeyProduct(partNumber);
+    
+    if (productData) {
+      return extractDigiKeyStock(productData);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Digi-Key stock fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function fetchDigikeyLeadTime(partNumber) {
+  try {
+    checkDigiKeyRateLimit();
+    
+    let productData = searchDigiKeyProduct(partNumber);
+    
+    if (productData) {
+      return extractDigiKeyLeadTime(productData);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Digi-Key lead time fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function checkDigiKeyRateLimit() {
+  const properties = PropertiesService.getScriptProperties();
+  const today = new Date().toDateString();
+  const requestCount = parseInt(properties.getProperty('digikey_requests_' + today) || '0');
+  
+  if (requestCount >= DIGIKEY_CONFIG.MAX_REQUESTS_PER_DAY) {
+    throw new Error('Digi-Key daily rate limit exceeded');
+  }
+  
+  properties.setProperty('digikey_requests_' + today, (requestCount + 1).toString());
+  
+  return true;
+}
+
+// ==================== MOUSER API INTEGRATION ====================
+
+function searchMouserByPartNumber(partNumber) {
+  try {
+    checkMouserRateLimit();
+    
+    const searchPayload = {
+      'SearchByPartRequest': {
+        'mouserPartNumber': partNumber,
+        'partSearchOptions': 'string'
+      }
+    };
+    
+    const options = {
+      'method': 'POST',
+      'headers': {
+        'Content-Type': 'application/json'
+      },
+      'payload': JSON.stringify(searchPayload),
+      'muteHttpExceptions': true
+    };
+    
+    const url = MOUSER_CONFIG.SEARCH_URL + '?apiKey=' + MOUSER_CONFIG.API_KEY;
+    const response = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    
+    if (responseCode === 200) {
+      const data = JSON.parse(response.getContentText());
+      
+      if (data.SearchResults && data.SearchResults.Parts && data.SearchResults.Parts.length > 0) {
+        return data.SearchResults.Parts[0];
+      } else {
+        console.log('No exact match found on Mouser for: ' + partNumber);
+        return null;
+      }
+    } else {
+      console.error('Mouser exact search failed: ' + responseCode);
+      return null;
+    }
+  } catch (error) {
+    console.error('Error in Mouser exact search for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function searchMouserByKeyword(partNumber) {
+  try {
+    checkMouserRateLimit();
+    
+    const searchPayload = {
+      'SearchByKeywordRequest': {
+        'keyword': partNumber,
+        'records': 1,
+        'startingRecord': 0
+      }
+    };
+    
+    const options = {
+      'method': 'POST',
+      'headers': {
+        'Content-Type': 'application/json'
+      },
+      'payload': JSON.stringify(searchPayload),
+      'muteHttpExceptions': true
+    };
+    
+    const url = MOUSER_CONFIG.KEYWORD_SEARCH_URL + '?apiKey=' + MOUSER_CONFIG.API_KEY;
+    const response = UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    
+    if (responseCode === 200) {
+      const data = JSON.parse(response.getContentText());
+      
+      if (data.SearchResults && data.SearchResults.Parts && data.SearchResults.Parts.length > 0) {
+        return data.SearchResults.Parts[0];
+      } else {
+        console.log('No keyword match found on Mouser for: ' + partNumber);
+        return null;
+      }
+    } else {
+      console.error('Mouser keyword search failed: ' + responseCode);
+      return null;
+    }
+  } catch (error) {
+    console.error('Error in Mouser keyword search for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function extractMouserPrice(productData) {
+  try {
+    if (!productData) {
+      return null;
+    }
+    
+    if (productData.PriceBreaks && productData.PriceBreaks.length > 0) {
+      const sortedPrices = productData.PriceBreaks.sort((a, b) => parseInt(a.Quantity) - parseInt(b.Quantity));
+      const unitPrice = sortedPrices[0];
+      
+      const priceStr = unitPrice.Price.replace(/[^0-9.-]+/g, '');
+      const price = parseFloat(priceStr);
+      
+      return price;
+    }
+    
+    if (productData.UnitPrice) {
+      const priceStr = productData.UnitPrice.replace(/[^0-9.-]+/g, '');
+      const price = parseFloat(priceStr);
+      return price;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error extracting price from Mouser data:', error);
+    return null;
+  }
+}
+
+function extractMouserStock(productData) {
+  try {
+    if (!productData) return 0;
+    
+    const stockFields = ['AvailabilityInStock', 'Availability', 'Stock', 'InStock'];
+    
+    for (const field of stockFields) {
+      if (productData[field]) {
+        const stockStr = productData[field].toString().replace(/[^0-9]/g, '');
+        const stock = parseInt(stockStr) || 0;
+        if (stock > 0) {
+          return stock;
+        }
+      }
+    }
+    
+    return 0;
+  } catch (error) {
+    console.error('Error extracting stock from Mouser data:', error);
+    return 0;
+  }
+}
+
+function extractMouserLeadTime(productData) {
+  try {
+    if (!productData) return 'Unknown';
+    
+    const stock = extractMouserStock(productData);
+    if (stock > 0) {
+      return 'In Stock';
+    }
+    
+    const leadTimeFields = ['LeadTime', 'DeliveryTime', 'ShippingTime'];
+    
+    for (const field of leadTimeFields) {
+      if (productData[field]) {
+        return productData[field];
+      }
+    }
+    
+    return 'Contact Supplier';
+  } catch (error) {
+    console.error('Error extracting lead time from Mouser data:', error);
+    return 'Unknown';
+  }
+}
+
+function fetchMouserPrice(partNumber) {
+  try {
+    console.log('🔍 Fetching price for ' + partNumber + ' from Mouser...');
+    
+    let productData = searchMouserByPartNumber(partNumber);
+    
+    if (!productData) {
+      console.log('Exact part search failed, trying keyword search...');
+      productData = searchMouserByKeyword(partNumber);
+    }
+    
+    if (productData) {
+      const price = extractMouserPrice(productData);
+      if (price) {
+        console.log('✅ Mouser price found: $' + price);
+        return price;
+      }
+    }
+    
+    console.log('❌ No price found on Mouser for ' + partNumber);
+    return null;
+  } catch (error) {
+    console.error('Mouser price fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function fetchMouserStock(partNumber) {
+  try {
+    let productData = searchMouserByPartNumber(partNumber);
+    if (!productData) {
+      productData = searchMouserByKeyword(partNumber);
+    }
+    
+    if (productData) {
+      return extractMouserStock(productData);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Mouser stock fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function fetchMouserLeadTime(partNumber) {
+  try {
+    let productData = searchMouserByPartNumber(partNumber);
+    if (!productData) {
+      productData = searchMouserByKeyword(partNumber);
+    }
+    
+    if (productData) {
+      return extractMouserLeadTime(productData);
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Mouser lead time fetch failed for ' + partNumber + ':', error);
+    return null;
+  }
+}
+
+function checkMouserRateLimit() {
+  const properties = PropertiesService.getScriptProperties();
+  const today = new Date().toDateString();
+  const requestCount = parseInt(properties.getProperty('mouser_requests_' + today) || '0');
+  
+  if (requestCount >= MOUSER_CONFIG.MAX_REQUESTS_PER_DAY) {
+    throw new Error('Mouser daily rate limit exceeded');
+  }
+  
+  properties.setProperty('mouser_requests_' + today, (requestCount + 1).toString());
+  
+  return true;
+}
+
+/**
+ * PART 3: UTILITIES & TESTING FUNCTIONS (SYNTAX ERROR FREE)
+ * Add this after Part 1 and Part 2
+ */
+
+// ==================== UPDATE APPLICATION ====================
+
+function applyUpdates(sheet, rowIndex, updates) {
+  updates.forEach(update => {
+    const columnIndex = getColumnIndex(sheet, update.field);
+    if (columnIndex > 0) {
+      sheet.getRange(rowIndex, columnIndex).setValue(update.newValue);
+    }
+  });
+  
+  const lastModifiedColumn = getColumnIndex(sheet, 'Last Updated');
+  if (lastModifiedColumn > 0) {
+    sheet.getRange(rowIndex, lastModifiedColumn).setValue(new Date());
+  }
+}
+
+function getColumnIndex(sheet, headerName) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  return headers.indexOf(headerName) + 1;
+}
+
+// ==================== LOGGING AND NOTIFICATIONS ====================
+
+function logChanges(changes) {
+  const logSheet = getOrCreateSheet(CONFIG.LOG_SHEET_NAME);
+  
+  if (logSheet.getLastRow() === 0) {
+    logSheet.getRange(1, 1, 1, 8).setValues([[
+      'Timestamp', 'Part Number', 'Field', 'Old Value', 'New Value', 
+      'Change %', 'Type', 'Significant'
+    ]]);
+  }
+  
+  const logData = changes.map(change => [
+    change.timestamp,
+    change.partNumber,
+    change.field,
+    change.oldValue,
+    change.newValue,
+    change.changePercent || '',
+    change.type,
+    change.significant ? 'YES' : 'NO'
+  ]);
+  
+  if (logData.length > 0) {
+    logSheet.getRange(logSheet.getLastRow() + 1, 1, logData.length, 8).setValues(logData);
+  }
+}
+
+function sendUpdateNotification(changes) {
+  if (!CONFIG.ALERT_EMAIL) return;
+  
+  const significantChanges = changes.filter(change => change.significant);
+  
+  if (significantChanges.length === 0) return;
+  
+  const subject = 'Product Update Alert - ' + significantChanges.length + ' Significant Changes';
+  
+  let body = 'The following significant product changes were detected:\n\n';
+  
+  significantChanges.forEach(change => {
+    body += '• ' + change.partNumber + ': ' + change.field + ' changed from ' + change.oldValue + ' to ' + change.newValue;
+    if (change.changePercent) {
+      body += ' (' + change.changePercent + '% change)';
+    }
+    body += '\n';
+  });
+  
+  body += '\nFor complete details, check the Change Log sheet in your product database.';
+  
+  try {
+    MailApp.sendEmail(CONFIG.ALERT_EMAIL, subject, body);
+    console.log('Update notification sent successfully');
+  } catch (error) {
+    console.error('Failed to send notification email:', error);
+  }
+}
+
+function sendErrorNotification(error) {
+  if (!CONFIG.ALERT_EMAIL) return;
+  
+  const subject = 'Product Update System Error';
+  const body = 'An error occurred during the product update process:\n\n' + error.toString() + '\n\nPlease check the system logs for more details.';
+  
+  try {
+    MailApp.sendEmail(CONFIG.ALERT_EMAIL, subject, body);
+  } catch (emailError) {
+    console.error('Failed to send error notification:', emailError);
+  }
+}
+
+// ==================== UTILITY FUNCTIONS ====================
+
+function getOrCreateSheet(sheetName) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+    console.log('Created new sheet: ' + sheetName);
+  }
+  
+  return sheet;
+}
+
+function generateDailyReport() {
+  const logSheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.LOG_SHEET_NAME);
+  if (!logSheet) return;
+  
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  
+  const data = logSheet.getDataRange().getValues();
+  const yesterdayChanges = data.filter(row => {
+    const timestamp = new Date(row[0]);
+    return timestamp.toDateString() === yesterday.toDateString();
+  });
+  
+  if (yesterdayChanges.length > 0 && CONFIG.ALERT_EMAIL) {
+    const subject = 'Daily Product Update Report - ' + yesterdayChanges.length + ' Changes';
+    let body = 'Daily summary of product changes for ' + yesterday.toDateString() + ':\n\n';
+    
+    yesterdayChanges.forEach(change => {
+      body += '• ' + change[1] + ': ' + change[2] + ' changed from ' + change[3] + ' to ' + change[4] + '\n';
+    });
+    
+    MailApp.sendEmail(CONFIG.ALERT_EMAIL, subject, body);
+  }
+}
+
+function initializeSystem() {
+  console.log('Initializing Product Auto-Update System with Dual Suppliers...');
+  
+  const productSheet = getOrCreateSheet(CONFIG.PRODUCT_SHEET_NAME);
+  
+  if (productSheet.getLastRow() === 0) {
+    productSheet.getRange(1, 1, 1, 10).setValues([[
+      'Part Number', 'Description', 'Supplier', 'Unit Price', 
+      'Stock Quantity', 'Lead Time', 'Package', 'Datasheet URL',
+      'Last Updated', 'Notes'
+    ]]);
+    
+    productSheet.getRange(2, 1, 6, 10).setValues([
+      ['LM358N', 'Dual Op Amp (Digi-Key)', 'digikey', 0.50, 0, '', 'DIP-8', '', '', 'Test part - Digi-Key'],
+      ['LM358N', 'Dual Op Amp (Mouser)', 'mouser', 0.50, 0, '', 'DIP-8', '', '', 'Test part - Mouser'],
+      ['LM555CN', 'Timer IC (Digi-Key)', 'digikey', 0.75, 0, '', 'DIP-8', '', '', 'Test part - Digi-Key'],
+      ['LM555CN', 'Timer IC (Mouser)', 'mouser', 0.75, 0, '', 'DIP-8', '', '', 'Test part - Mouser'],
+      ['1N4148', 'Switching Diode (Digi-Key)', 'digikey', 0.12, 0, '', 'DO-35', '', '', 'Test part - Digi-Key'],
+      ['1N4148', 'Switching Diode (Mouser)', 'mouser', 0.12, 0, '', 'DO-35', '', '', 'Test part - Mouser']
+    ]);
+    
+    console.log('Sample product data added from both suppliers for testing.');
+  }
+  
+  setupAutomaticUpdates();
+  
+  console.log('System initialized successfully!');
+  console.log('Next steps:');
+  console.log('1. Test both APIs with testBothSuppliers()');
+  console.log('2. Test with sample products using testSingleProduct()');
+  console.log('3. Run full update with updateAllProducts()');
+}
+
+// ==================== TESTING FUNCTIONS ====================
+
+function testDigiKeyAPI() {
+  console.log('🧪 Testing Digi-Key API...');
+  
+  try {
+    console.log('🔑 Getting access token...');
+    const token = getDigiKeyAccessToken();
+    
+    if (token) {
+      console.log('✅ Authentication successful');
+      
+      console.log('🔍 Testing product search...');
+      const testPart = 'LM358N';
+      const searchResult = searchDigiKeyProduct(testPart);
+      
+      if (searchResult) {
+        console.log('✅ Search API working!');
+        console.log('Found: ' + (searchResult.ProductDescription || 'No description'));
+        
+        const price = extractDigiKeyPrice(searchResult);
+        const stock = extractDigiKeyStock(searchResult);
+        const leadTime = extractDigiKeyLeadTime(searchResult);
+        
+        if (price) console.log('✅ Price: $' + price);
+        if (stock !== null) console.log('✅ Stock: ' + stock + ' units');
+        if (leadTime) console.log('✅ Lead Time: ' + leadTime);
+        
+        console.log('🎉 Digi-Key integration is fully functional!');
+        return true;
+      } else {
+        console.log('❌ Product search failed');
+        return false;
+      }
+    } else {
+      console.log('❌ Authentication failed');
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Digi-Key test failed:', error);
+    return false;
+  }
+}
+
+function testMouserAPI() {
+  console.log('🧪 Testing Mouser API...');
+  
+  try {
+    console.log('🔍 Testing product search...');
+    const testPart = 'LM358N';
+    
+    let productData = searchMouserByKeyword(testPart);
+    
+    if (productData) {
+      console.log('✅ Mouser search successful!');
+      console.log('Found: ' + (productData.Description || 'No description'));
+      console.log('Manufacturer: ' + (productData.Manufacturer || 'N/A'));
+      
+      const price = extractMouserPrice(productData);
+      const stock = extractMouserStock(productData);
+      const leadTime = extractMouserLeadTime(productData);
+      
+      if (price) console.log('✅ Price: $' + price);
+      if (stock !== null) console.log('✅ Stock: ' + stock + ' units');
+      if (leadTime) console.log('✅ Lead Time: ' + leadTime);
+      
+      console.log('🎉 Mouser integration is working correctly!');
+      return true;
+    } else {
+      console.log('❌ Product search failed');
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ Mouser test failed:', error);
+    return false;
+  }
+}
+
+function testBothSuppliers() {
+  console.log('🧪 TESTING BOTH SUPPLIERS');
+  console.log('========================');
+  
+  const testPart = 'LM358N';
+  
+  console.log('🔍 Testing Digi-Key...');
+  const digiKeyWorking = testDigiKeyAPI();
+  
+  console.log('\n🔍 Testing Mouser...');
+  const mouserWorking = testMouserAPI();
+  
+  console.log('\n📊 COMPARISON RESULTS:');
+  console.log('=====================');
+  
+  if (digiKeyWorking && mouserWorking) {
+    console.log('✅ Both suppliers working! Testing price comparison...');
+    
+    console.log('\n💰 PRICE COMPARISON for ' + testPart + ':');
+    
+    const digiKeyPrice = fetchDigikeyPrice(testPart);
+    Utilities.sleep(2000);
+    const mouserPrice = fetchMouserPrice(testPart);
+    
+    console.log('   Digi-Key: ' + (digiKeyPrice ? '$' + digiKeyPrice : 'N/A'));
+    console.log('   Mouser:   ' + (mouserPrice ? '$' + mouserPrice : 'N/A'));
+    
+    if (digiKeyPrice && mouserPrice) {
+      const difference = Math.abs(digiKeyPrice - mouserPrice);
+      const percentDiff = ((difference / Math.min(digiKeyPrice, mouserPrice)) * 100).toFixed(1);
+      const cheaper = digiKeyPrice < mouserPrice ? 'Digi-Key' : 'Mouser';
+      const savings = Math.abs(digiKeyPrice - mouserPrice).toFixed(3);
+      
+      console.log('   Difference: $' + difference.toFixed(3) + ' (' + percentDiff + '%)');
+      console.log('   ' + cheaper + ' is $' + savings + ' cheaper for this part');
+      
+      if (difference > 0.01) {
+        console.log('   💡 Potential savings by choosing ' + cheaper + '!');
+      }
+    }
+    
+    console.log('\n🎉 Multi-supplier monitoring is ready!');
+    return true;
+  } else {
+    console.log('❌ Issues found:');
+    if (!digiKeyWorking) console.log('   • Digi-Key API not working');
+    if (!mouserWorking) console.log('   • Mouser API not working');
+    return false;
+  }
+}
+
+function testSingleProduct() {
+  const sheet = getOrCreateSheet(CONFIG.PRODUCT_SHEET_NAME);
+  const products = getProductData(sheet);
+  
+  if (products.length > 0) {
+    const testProduct = products[0];
+    console.log('🔍 Testing product: ' + testProduct['Part Number']);
+    console.log('Supplier: ' + testProduct['Supplier']);
+    console.log('Current Price: ' + testProduct['Unit Price']);
+    
+    const updates = checkForUpdates(testProduct);
+    console.log('Updates found: ' + updates.length);
+    
+    if (updates.length > 0) {
+      console.log('✅ Test successful - updates detected!');
+      updates.forEach(update => {
+        console.log('  • ' + update.field + ': ' + update.oldValue + ' → ' + update.newValue);
+        if (update.changePercent) {
+          console.log('    Change: ' + update.changePercent + '%');
+        }
+      });
+    } else {
+      console.log('✅ Test completed - no updates needed (current data is up to date)');
+    }
+  } else {
+    console.log('❌ No products found for testing. Please add some products first.');
+    console.log('💡 Run initializeSystem() to create sample data');
+  }
+}
+
+function generateSummaryReport() {
+  console.log('📊 DUAL-SUPPLIER PRODUCT DATABASE SUMMARY');
+  console.log('=========================================');
+  
+  const sheet = getOrCreateSheet(CONFIG.PRODUCT_SHEET_NAME);
+  const products = getProductData(sheet);
+  
+  if (products.length === 0) {
+    console.log('❌ No products in database');
+    return;
+  }
+  
+  console.log('📦 Total Products: ' + products.length);
+  
+  const supplierCounts = {};
+  products.forEach(product => {
+    const supplier = product['Supplier'] || 'Unknown';
+    supplierCounts[supplier] = (supplierCounts[supplier] || 0) + 1;
+  });
+  
+  console.log('\n📋 Products by Supplier:');
+  Object.entries(supplierCounts).forEach(([supplier, count]) => {
+    console.log('  • ' + supplier + ': ' + count + ' products');
+  });
+  
+  const prices = products
+    .map(p => parseFloat(p['Unit Price'] || 0))
+    .filter(price => price > 0);
+  
+  if (prices.length > 0) {
+    const totalValue = prices.reduce((sum, price) => sum + price, 0);
+    const avgPrice = totalValue / prices.length;
+    const maxPrice = Math.max(...prices);
+    const minPrice = Math.min(...prices);
+    
+    console.log('\n💰 Price Statistics:');
+    console.log('  • Products with prices: ' + prices.length + '/' + products.length);
+    console.log('  • Average price: $' + avgPrice.toFixed(2));
+    console.log('  • Price range: $' + minPrice.toFixed(2) + ' - $' + maxPrice.toFixed(2));
+    console.log('  • Total value: $' + totalValue.toFixed(2));
+  }
+  
+  const properties = PropertiesService.getScriptProperties();
+  const today = new Date().toDateString();
+  const digiKeyRequests = parseInt(properties.getProperty('digikey_requests_' + today) || '0');
+  const mouserRequests = parseInt(properties.getProperty('mouser_requests_' + today) || '0');
+  
+  console.log('\n📡 Today\'s API Usage:');
+  console.log('  • Digi-Key: ' + digiKeyRequests + '/' + DIGIKEY_CONFIG.MAX_REQUESTS_PER_DAY + ' requests');
+  console.log('  • Mouser: ' + mouserRequests + '/' + MOUSER_CONFIG.MAX_REQUESTS_PER_DAY + ' requests');
+  console.log('  • Total: ' + (digiKeyRequests + mouserRequests) + '/11,000 requests');
+  
+  console.log('\n✅ Summary report complete!');
+}
+
+function setupDualSupplierMonitoring() {
+  console.log('🚀 SETTING UP DUAL-SUPPLIER MONITORING');
+  console.log('=====================================');
+  
+  console.log('Step 1: Initializing system...');
+  initializeSystem();
+  
+  console.log('\nStep 2: Testing APIs...');
+  if (!testBothSuppliers()) {
+    console.log('❌ API testing failed. Please check your credentials.');
+    return false;
+  }
+  
+  console.log('\nStep 3: Testing with sample data...');
+  testSingleProduct();
+  
+  console.log('\nStep 4: Running initial update...');
+  updateAllProducts();
+  
+  console.log('\nStep 5: Generating summary...');
+  generateSummaryReport();
+  
+  console.log('\n✅ DUAL-SUPPLIER SETUP COMPLETE!');
+  console.log('================================');
+  console.log('🎉 Your system can now:');
+  console.log('  • Monitor prices from both Digi-Key and Mouser');
+  console.log('  • Compare prices automatically');
+  console.log('  • Get alerts when prices change >5%');
+  console.log('  • Track availability across multiple sources');
+  console.log('  • Use 11,000 total API requests per day');
+  console.log('  • Send email notifications for significant changes');
+  
+  console.log('\n📋 Available Commands:');
+  console.log('  • updateAllProducts() - Update all prices now');
+  console.log('  • testBothSuppliers() - Test API connections');
+  console.log('  • generateSummaryReport() - View statistics');
+  console.log('  • addNewProduct("PART", "DESC", "supplier") - Add parts');
+  console.log('  • showHelp() - See all available functions');
+  
+  return true;
+}
+
+function quickStart() {
+  console.log('🚀 QUICK START: Dual-Supplier Product Monitoring');
+  console.log('===============================================');
+  
+  try {
+    setupDualSupplierMonitoring();
+    console.log('\n🎉 QUICK START COMPLETE!');
+    console.log('Your dual-supplier monitoring system is ready!');
+  } catch (error) {
+    console.error('❌ Quick start failed:', error);
+    console.log('💡 Try running individual test functions to debug');
+  }
+}
+
+function addNewProduct(partNumber, description, supplier) {
+  supplier = supplier || 'digikey';
+  console.log('➕ Adding new product: ' + partNumber + ' (' + supplier + ')');
+  
+  const sheet = getOrCreateSheet(CONFIG.PRODUCT_SHEET_NAME);
+  const lastRow = sheet.getLastRow();
+  
+  sheet.getRange(lastRow + 1, 1, 1, 10).setValues([[
+    partNumber,
+    description,
+    supplier,
+    0,
+    0,
+    '',
+    '',
+    '',
+    new Date(),
+    'Added manually'
+  ]]);
+  
+  console.log('✅ Product added to database');
+  
+  console.log('🔄 Fetching current data...');
+  const updates = checkForUpdates({
+    'Part Number': partNumber,
+    'Supplier': supplier,
+    'Unit Price': 0,
+    'Stock Quantity': 0,
+    'Lead Time': ''
+  });
+  
+  if (updates.length > 0) {
+    applyUpdates(sheet, lastRow + 1, updates);
+    console.log('✅ Updated ' + updates.length + ' fields with current data');
+  }
+}
+
+function resetRateLimits() {
+  const properties = PropertiesService.getScriptProperties();
+  const today = new Date().toDateString();
+  
+  properties.deleteProperty('digikey_requests_' + today);
+  properties.deleteProperty('mouser_requests_' + today);
+  console.log('✅ Rate limit counters reset for both suppliers');
+}
+
+function clearAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(trigger => ScriptApp.deleteTrigger(trigger));
+  console.log('✅ Cleared ' + triggers.length + ' triggers');
+}
+
+function showHelp() {
+  console.log('🆘 DUAL-SUPPLIER PRODUCT MONITORING HELP');
+  console.log('=======================================');
+  console.log('');
+  console.log('🚀 GETTING STARTED:');
+  console.log('  quickStart()                    - Complete setup in one command');
+  console.log('  initializeSystem()              - Create sheets and sample data');
+  console.log('  setupDualSupplierMonitoring()   - Full dual-supplier setup');
+  console.log('');
+  console.log('🧪 TESTING:');
+  console.log('  testDigiKeyAPI()                - Test Digi-Key connection');
+  console.log('  testMouserAPI()                 - Test Mouser connection');
+  console.log('  testBothSuppliers()             - Test both APIs with comparison');
+  console.log('  testSingleProduct()             - Test with one product');
+  console.log('');
+  console.log('🔄 UPDATING:');
+  console.log('  updateAllProducts()             - Update all products from both suppliers');
+  console.log('  setupAutomaticUpdates()         - Enable hourly automatic updates');
+  console.log('');
+  console.log('📦 MANAGING PRODUCTS:');
+  console.log('  addNewProduct("PART", "DESC", "supplier") - Add new product');
+  console.log('  generateSummaryReport()         - View database and API usage stats');
+  console.log('');
+  console.log('🔧 MAINTENANCE:');
+  console.log('  clearAllTriggers()              - Remove automatic updates');
+  console.log('  resetRateLimits()               - Reset API rate limits');
+  console.log('  generateDailyReport()           - Generate daily change report');
+  console.log('');
+  console.log('💡 SUPPORTED SUPPLIERS: digikey, mouser');
+  console.log('💡 TOTAL API LIMITS: 11,000 requests/day (1K DK + 10K Mouser)');
+  console.log('💡 TIP: Start with quickStart() for automatic setup!');
+}
